@@ -1,0 +1,23 @@
+name: cleanup-old-logs
+on:
+  schedule:
+    # 每周一 UTC 0 点清理一次
+    - cron: '0 0 * * 1'
+  workflow_dispatch:  # 可手动触发
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete old workflow runs (保留最近500个)
+        uses: MajorScruffy/delete-old-workflow-runs@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          retain_days: 14     # 保留14天内的
+          keep_minimum_runs: 500
+
+      - name: Delete old artifacts
+        uses: geekyeggo/delete-artifact@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          age: 14d             # 删除14天前的artifact
