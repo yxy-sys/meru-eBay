@@ -72,6 +72,23 @@ def run_once():
         # 抓页面
         code, html = fetch(url)
 
+        # === 新增：链接被删除(404/410)时，也要清零并通知 ===
+        if code in (404, 410):
+            print(f"[MERCARI] {url} HTTP={code} status=DELETED trigger={trigger} sku={sku or '∅'}")
+            # 先尝试清零
+            res = revise_inventory_status(item_id=item_id, sku=sku, quantity=0)
+            print("eBay update (deleted link):", res)
+            # 通知成功/失败
+            if res.get("ok"):
+                notify(f"🗑️ [MERCARI] 链接失效（HTTP {code}）→ eBay 已清零：{ident}\n{url}")
+            else:
+                status_code = res.get("status")
+                body = res.get("body") or res.get("error") or ""
+                snippet = str(body)[:500]
+                notify(f"❌ 链接失效但 eBay 清零失败：{ident}\nHTTP={status_code}\n{snippet}\n{url}")
+            continue
+        # === 新增结束 ===
+
         # 判状态
         status = "UNKNOWN" if code != 200 else mercari.detect(html)
 
