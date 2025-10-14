@@ -1,7 +1,13 @@
-requests
-beautifulsoup4
-lxml
-python-dotenv
-pandas
-gspread
-google-auth
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+python-dotenv>=1.0
+pandas>=2.2
+
+# 抓取用：必须
+playwright>=1.47
+
+# 只有当 SHEETS_MODE=SERVICE_API 时才需要（用 gspread 读表）
+gspread>=6.0
+google-auth>=2.35
+google-auth-oauthlib>=1.2
