@@ -33,7 +33,7 @@ jobs:
       REQUESTS_TIMEOUT:  "25"
       DRY_RUN:           "false"
 
-      # ==== Telegram（可选，不配就不发） ====
+      # （可选）保留给你的 Python 内部通知使用
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
 
@@ -56,68 +56,37 @@ jobs:
         run: |
           python -m playwright install --with-deps chromium
 
-      # 运行脚本并捕获日志/退出码；同时检查是否出现清零信号
+      # 运行脚本并记录日志；只把失败写入 status.txt，让下一步统一发“失败通知”
       - name: Run main script (capture logs & status)
         shell: bash
         run: |
           set -o pipefail
-          # 运行并把 stdout+stderr 同时写入 run.log
           python main_gsheets.py 2>&1 | tee run.log
           CODE=${PIPESTATUS[0]}
-
-          # 如果脚本失败，写 error 标记
           if [ $CODE -ne 0 ]; then
             echo "error" > status.txt
           fi
-
-          # 如果日志里出现清零/售罄信号，写 ebay_zero 标记
-          # 兼容你日志里可能出现的几种样式：
-          #   status=OUT_OF_STOCK / trigger=soldout / 'quantity': 0 / "quantity": 0
-          if grep -Eiq 'OUT_OF_STOCK|trigger=soldout|quantity[[:space:]]*[:=][[:space:]]*0' run.log; then
-            # 如果之前没有失败标记，就记录为清零通知
-            if [ ! -f status.txt ]; then
-              echo "ebay_zero" > status.txt
-            fi
-          fi
-
-          # 将退出码向后传递，确保工作流失败时能标红
           exit $CODE
 
-      # 仅在失败或检测到清零时发送 Telegram 通知（没配 token/chat id 会自动跳过）
-      - name: Notify Telegram on fail/zero
-        if: always()
+      # 仅在失败时由工作流发 Telegram 通知（成功/清零通知由 Python 内部 notify() 负责）
+      - name: Notify Telegram on fail
+        if: failure()
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           RUN_URL:   ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         shell: bash
         run: |
-          # 没配 Telegram 则跳过
           if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
             echo "Telegram secrets not set, skip notify."
             exit 0
           fi
-
-          if [ -f status.txt ]; then
-            STATUS=$(cat status.txt)
-            if [ "$STATUS" = "error" ]; then
-              TEXT="❌ eBay 库存同步失败，请检查运行日志。\n🔗 $RUN_URL"
-            elif [ "$STATUS" = "ebay_zero" ]; then
-              TEXT="⚠️ 检测到 eBay 商品库存被清零（可能已售出或下架）。\n🔗 $RUN_URL"
-            fi
-
-            if [ -n "$TEXT" ]; then
-              curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-                   -H "Content-Type: application/json" \
-                   -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":\"${TEXT}\",\"disable_web_page_preview\":true}" \
-                   >/dev/null
-              echo "Telegram notified: $STATUS"
-            else
-              echo "No telegram message composed."
-            fi
-          else
-            echo "No status.txt, no need to notify."
-          fi
+          TEXT="❌ eBay 同步失败，请检查运行日志。\n🔗 $RUN_URL"
+          curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+               -H "Content-Type: application/json" \
+               -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":\"${TEXT}\",\"disable_web_page_preview\":true}" \
+               >/dev/null
+          echo "Sent Telegram fail notify"
 
       - name: Upload logs (optional)
         if: always()
