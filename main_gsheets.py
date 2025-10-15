@@ -5,7 +5,8 @@ from dotenv import load_dotenv
 from sheet_reader import read_ledger
 from fetcher import fetch
 from detectors import mercari
-from ebay_updater import revise_inventory_status
+# 改：导入带自动回退的函数
+from ebay_updater import update_qty_with_fallback
 from notify import notify
 
 load_dotenv()
@@ -72,18 +73,18 @@ def run_once():
         # 抓页面
         code, html = fetch(url)
 
-        # === 新增：链接被删除(404/410)时，也要清零并通知 ===
+        # === 链接被删除(404/410)时，也要清零并通知 ===
         if code in (404, 410):
             print(f"[MERCARI] {url} HTTP={code} status=DELETED trigger={trigger} sku={sku or '∅'}")
-            # 先尝试清零
-            res = revise_inventory_status(item_id=item_id, sku=sku, quantity=0)
+            # 改：使用自动回退（优先SKU，失败回退ItemID）
+            res = update_qty_with_fallback(item_id=item_id, sku=sku, quantity=0)
             print("eBay update (deleted link):", res)
             # 通知成功/失败
             if res.get("ok"):
                 notify(f"🗑️ [MERCARI] 链接失效（HTTP {code}）→ eBay 已清零：{ident}\n{url}")
             else:
                 status_code = res.get("status")
-                body = res.get("body") or res.get("error") or ""
+                body = (res.get("body") or res.get("error") or "")
                 snippet = str(body)[:500]
                 notify(f"❌ 链接失效但 eBay 清零失败：{ident}\nHTTP={status_code}\n{snippet}\n{url}")
             continue
@@ -108,8 +109,8 @@ def run_once():
         #   注意：如果你不想提前发售罄提示，可以注释掉下一行。
         notify(f"⚠️ 检测到煤炉售罄：{ident}\n{url}")
 
-        # ② 调用 eBay 清 0
-        res = revise_inventory_status(item_id=item_id, sku=sku, quantity=0)
+        # ② 调用 eBay 清 0（改：带回退）
+        res = update_qty_with_fallback(item_id=item_id, sku=sku, quantity=0)
         print("eBay update:", res)
 
         # ③ 根据 eBay 结果发通知
@@ -128,4 +129,3 @@ def run_once():
 
 if __name__ == "__main__":
     run_once()
-
