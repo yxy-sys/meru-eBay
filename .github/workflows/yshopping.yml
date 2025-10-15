@@ -2,7 +2,7 @@ name: yshopping-ebay-sync
 
 on:
   schedule:
-    - cron: "0,60 * * * *"   # 每 60 分钟（UTC）；东京时间 = +9h
+    - cron: "0,59 * * * *"   # 每 59 分钟（UTC）；东京时间 = +9h
   workflow_dispatch:
 
 concurrency:
