@@ -1,0 +1,99 @@
+name: yshopping-ebay-sync
+
+on:
+  schedule:
+    - cron: "0,60 * * * *"   # 每 60 分钟（UTC）；东京时间 = +9h
+  workflow_dispatch:
+
+concurrency:
+  group: yshopping-ebay-sync
+  cancel-in-progress: false
+
+jobs:
+  run-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      EBAY_DEV_ID:       ${{ secrets.EBAY_DEV_ID }}
+      EBAY_APP_ID:       ${{ secrets.EBAY_APP_ID }}
+      EBAY_CERT_ID:      ${{ secrets.EBAY_CERT_ID }}
+      EBAY_AUTH_TOKEN:   ${{ secrets.EBAY_AUTH_TOKEN }}
+
+      SHEETS_MODE:       PUBLIC_CSV
+      SHEET_CSV_URL:     ${{ secrets.SHEET_CSV_URL }}
+
+      FETCH_MODE:        PLAYWRIGHT
+      PW_BLOCK_MEDIA:    "true"
+      REQUESTS_TIMEOUT:  "25"
+      DRY_RUN:           "false"
+
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright browsers & deps
+        run: |
+          python -m playwright install --with-deps chromium
+
+      - name: Run yshopping
+        shell: bash
+        run: |
+          set -o pipefail
+          python main_yshopping.py 2>&1 | tee run.log
+          CODE=${PIPESTATUS[0]}
+          if [ $CODE -ne 0 ]; then echo "error" > status.txt; fi
+
+          # 检测清零信号（日志里有 quantity=0 或已清零提示）
+          if grep -Eiq 'quantity[[:space:]]*[:=][[:space:]]*0|库存已清零' run.log; then
+            if [ ! -f status.txt ]; then echo "ebay_zero" > status.txt; fi
+          fi
+
+          exit $CODE
+
+      - name: Notify Telegram on fail/zero
+        if: always()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL:   ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          [ -z "$BOT_TOKEN" -o -z "$CHAT_ID" ] && echo "no telegram" && exit 0
+          if [ -f status.txt ]; then
+            STATUS=$(cat status.txt)
+            if [ "$STATUS" = "error" ]; then
+              TEXT="❌ Y!Shopping 同步失败，请检查日志。\n🔗 $RUN_URL"
+            elif [ "$STATUS" = "ebay_zero" ]; then
+              TEXT="⚠️ 检测到 eBay 库存被清零（Y!Shopping 触发）。\n🔗 $RUN_URL"
+            fi
+            if [ -n "$TEXT" ]; then
+              curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+                -H "Content-Type: application/json" \
+                -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":\"${TEXT}\",\"disable_web_page_preview\":true}" >/dev/null
+            fi
+          fi
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yshopping-logs
+          path: |
+            run.log
+            **/*.log
+            logs/**
+          if-no-files-found: ignore
