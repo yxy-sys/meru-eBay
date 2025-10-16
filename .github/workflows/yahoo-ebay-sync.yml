@@ -1,0 +1,102 @@
+name: yahoo-ebay-sync
+
+on:
+  schedule:
+    # 每天日本时间凌晨 1:00 运行一次（UTC 16:00） 本工作流适用yahoo拍卖  
+    - cron: "0 16 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: yahoo-ebay-sync
+  cancel-in-progress: false
+
+jobs:
+  run-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      EBAY_DEV_ID:       ${{ secrets.EBAY_DEV_ID }}
+      EBAY_APP_ID:       ${{ secrets.EBAY_APP_ID }}
+      EBAY_CERT_ID:      ${{ secrets.EBAY_CERT_ID }}
+      EBAY_AUTH_TOKEN:   ${{ secrets.EBAY_AUTH_TOKEN }}
+      SHEETS_MODE:       PUBLIC_CSV
+      SHEET_CSV_URL:     ${{ secrets.SHEET_CSV_URL }}
+      FETCH_MODE:        PLAYWRIGHT
+      PW_BLOCK_MEDIA:    "true"
+      REQUESTS_TIMEOUT:  "25"
+      DRY_RUN:           "false"
+
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright browsers & deps
+        run: |
+          python -m playwright install --with-deps chromium
+
+      - name: Run Yahoo-only sync
+        shell: bash
+        run: |
+          echo "🚀 Running Yahoo-only sync..."
+          python main_yahoo.py 2>&1 | tee run.log
+          CODE=${PIPESTATUS[0]}
+          if [ $CODE -ne 0 ]; then echo "error" > status.txt; fi
+
+          if grep -Eiq 'OUT_OF_STOCK|trigger=soldout|quantity[[:space:]]*[:=][[:space:]]*0' run.log; then
+            if [ ! -f status.txt ]; then echo "ebay_zero" > status.txt; fi
+          fi
+          exit $CODE
+
+      - name: Notify Telegram on fail/zero
+        if: always()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL:   ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
+            echo "Telegram secrets not set, skip notify."
+            exit 0
+          fi
+
+          if [ -f status.txt ]; then
+            STATUS=$(cat status.txt)
+            if [ "$STATUS" = "error" ]; then
+              TEXT="❌ [YAHOO] 同步失败，请检查运行日志。\n🔗 $RUN_URL"
+            elif [ "$STATUS" = "ebay_zero" ]; then
+              TEXT="⚠️ [YAHOO] 检测到 eBay 商品库存被清零。\n🔗 $RUN_URL"
+            fi
+            if [ -n "$TEXT" ]; then
+              curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+                   -H "Content-Type: application/json" \
+                   -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":\"${TEXT}\",\"disable_web_page_preview\":true}" \
+                   >/dev/null
+              echo "Telegram notified: $STATUS"
+            fi
+          fi
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yahoo-sync-logs
+          path: |
+            run.log
+            logs/**
+          if-no-files-found: ignore
