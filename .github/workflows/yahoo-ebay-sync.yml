@@ -2,8 +2,8 @@ name: yahoo-ebay-sync
 
 on:
   schedule:
-    # 每天日本时间凌晨 1:00 运行一次（UTC 16:00） 本工作流适用yahoo拍卖  
-    - cron: "0 16 * * *"
+    # 每小时 0 分跑一次（UTC）
+    - cron: "0 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -20,8 +20,10 @@ jobs:
       EBAY_APP_ID:       ${{ secrets.EBAY_APP_ID }}
       EBAY_CERT_ID:      ${{ secrets.EBAY_CERT_ID }}
       EBAY_AUTH_TOKEN:   ${{ secrets.EBAY_AUTH_TOKEN }}
+
       SHEETS_MODE:       PUBLIC_CSV
       SHEET_CSV_URL:     ${{ secrets.SHEET_CSV_URL }}
+
       FETCH_MODE:        PLAYWRIGHT
       PW_BLOCK_MEDIA:    "true"
       REQUESTS_TIMEOUT:  "25"
@@ -38,7 +40,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
+          cache: "pip"
 
       - name: Install dependencies
         run: |
@@ -49,17 +51,25 @@ jobs:
         run: |
           python -m playwright install --with-deps chromium
 
-      - name: Run Yahoo-only sync
+      - name: Run yahoo main & capture logs
         shell: bash
         run: |
-          echo "🚀 Running Yahoo-only sync..."
+          set -o pipefail
           python main_yahoo.py 2>&1 | tee run.log
           CODE=${PIPESTATUS[0]}
-          if [ $CODE -ne 0 ]; then echo "error" > status.txt; fi
 
-          if grep -Eiq 'OUT_OF_STOCK|trigger=soldout|quantity[[:space:]]*[:=][[:space:]]*0' run.log; then
-            if [ ! -f status.txt ]; then echo "ebay_zero" > status.txt; fi
+          # 脚本失败 -> 标记 error
+          if [ $CODE -ne 0 ]; then
+            echo "error" > status.txt
           fi
+
+          # 只有真正清零成功（脚本打印 EBAY_ZERO_OK）才标记 ebay_zero
+          if grep -Eiq 'EBAY_ZERO_OK' run.log; then
+            if [ ! -f status.txt ]; then
+              echo "ebay_zero" > status.txt
+            fi
+          fi
+
           exit $CODE
 
       - name: Notify Telegram on fail/zero
@@ -78,17 +88,23 @@ jobs:
           if [ -f status.txt ]; then
             STATUS=$(cat status.txt)
             if [ "$STATUS" = "error" ]; then
-              TEXT="❌ [YAHOO] 同步失败，请检查运行日志。\n🔗 $RUN_URL"
+              TEXT="❌ YAHOO 同步失败，请检查日志。\n🔗 $RUN_URL"
             elif [ "$STATUS" = "ebay_zero" ]; then
+              # 直接复用脚本里已包含 SKU/链接的清零通知；这条只是兜底提示
               TEXT="⚠️ [YAHOO] 检测到 eBay 商品库存被清零。\n🔗 $RUN_URL"
             fi
+
             if [ -n "$TEXT" ]; then
               curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
                    -H "Content-Type: application/json" \
                    -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":\"${TEXT}\",\"disable_web_page_preview\":true}" \
                    >/dev/null
               echo "Telegram notified: $STATUS"
+            else
+              echo "No telegram text to send."
             fi
+          else
+            echo "No status.txt, no need to notify."
           fi
 
       - name: Upload logs
@@ -98,5 +114,6 @@ jobs:
           name: yahoo-sync-logs
           path: |
             run.log
+            **/*.log
             logs/**
           if-no-files-found: ignore
