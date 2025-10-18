@@ -3,7 +3,7 @@ name: meru-ebay-sync
 on:
   schedule:
     # 每 15 分钟运行一次（UTC）
-    - cron: "*/15 * * * *"
+    - cron: "*/45 * * * *"
   workflow_dispatch:
 
 # 防止上一次还在跑时又触发一轮
