@@ -1,139 +1,41 @@
-# main_yahoo.py
-import os
-from dotenv import load_dotenv
+# detectors/yahoo.py
+from bs4 import BeautifulSoup
 
-from sheet_reader import read_ledger
-from fetcher import fetch
-from detectors import yahoo
-from ebay_updater import update_qty_with_fallback
-from notify import notify
-
-load_dotenv()
-
-
-# ---------- 小工具 ----------
-def _is_blank(value) -> bool:
-    if value is None:
-        return True
-    s = str(value).strip().lower()
-    return s in ("", "nan", "none", "null", "")
-
-
-def _norm(v) -> str:
-    return "" if _is_blank(v) else str(v).strip()
-
-
-def _norm_trigger(v: str) -> str:
-    """触发原因：空值默认 'soldout'；其他转小写。"""
-    s = str(v or "").strip().lower()
-    return "soldout" if s in ("", "nan", "none", "null", "") else s
-
-
-def _read_qty_from_row(row) -> int:
+def detect(html: str) -> str:
     """
-    从表格行里取目前 eBay 数量，用于避免重复清零/重复通知。
-    依次尝试：quantity、qty、ebay_qty；没有就返回 999 代表未知（不阻止清零）。
+    返回页面状态（供 main_yahoo.py 使用）：
+      - "SOLD"           ：二手闲鱼/PayPayフリマ SOLD、或显式“売り切れ/在庫なし”
+      - "ENDED"          ：拍卖已结束/被取消/被删除
+      - "IN_STOCK"       ：仍在售/在拍
+      - "UNKNOWN"        ：无法判断
     """
-    for key in ("quantity", "qty", "ebay_qty"):
-        if key in row:
-            v = row.get(key)
-            try:
-                return int(float(str(v).strip()))
-            except Exception:
-                pass
-    return 999  # 未提供数量列时，不阻止动作
+    if not html:
+        return "UNKNOWN"
 
+    soup = BeautifulSoup(html, "lxml")
+    text = soup.get_text(" ", strip=True)
+    tl = text.lower()
 
-def _should_zero(trigger: str, status: str) -> bool:
-    """
-    清零判断：
-      - trigger = soldout  -> 仅当 status in {"OUT_OF_STOCK", "SOLD", "ENDED"}
-      - trigger = lowstock -> 当 status in {"OUT_OF_STOCK", "LOW_STOCK", "SOLD", "ENDED"}
-      - status = UNKNOWN   -> 不清
-    """
-    if status == "UNKNOWN":
-        return False
-    t = _norm_trigger(trigger)
-    if t == "soldout":
-        return status in ("OUT_OF_STOCK", "SOLD", "ENDED")
-    if t == "lowstock":
-        return status in ("OUT_OF_STOCK", "LOW_STOCK", "SOLD", "ENDED")
-    return False
+    # —— 删除/取消/结束（拍卖常见文案）——
+    ended_keys = [
+        "このオークションは終了しています",
+        "出品が終了しました",
+        "出品が取り消されました",
+        "出品者により削除",
+        "商品は削除されました",
+    ]
+    if any(k in text for k in ended_keys):
+        return "ENDED"
 
+    # —— PayPayフリマ/二手 SOLD 徽标 & 售罄文案 —— 
+    # 页面会直接出现 "SOLD" 徽标，或“売り切れ/在庫なし”等字样
+    if ("SOLD" in html) or ("sold" in tl) or ("売り切れ" in text) or ("在庫なし" in text):
+        return "SOLD"
 
-def _looks_yahoo(url: str) -> bool:
-    u = (url or "").lower()
-    return ("yahoo.co.jp" in u) or ("yahoo.jp" in u)
+    # —— 拍卖进行中的常见文案（仅作“还在进行”的弱判断）——
+    if ("入札件数" in text) or ("残り時間" in text):
+        return "IN_STOCK"
 
-
-# ---------- 主流程 ----------
-def run_once():
-    df = read_ledger()
-    matched = 0
-
-    for _, row in df.iterrows():
-        url = _norm(row.get("source_url"))
-        if not url or not _looks_yahoo(url):
-            continue
-
-        matched += 1
-
-        item_id = _norm(row.get("ebay_item_id"))
-        sku     = _norm(row.get("sku"))
-        trigger = _norm_trigger(row.get("trigger", ""))
-
-        ident = sku if sku else (item_id if item_id else "(no-id)")
-
-        # 拉页面
-        code, html = fetch(url)
-
-        # 链接失效：404/410 -> 强制清零 + 通知（带 SKU + 链接）
-        if code in (404, 410):
-            print(f"[YAHOO] {url} HTTP={code} status=DELETED trigger={trigger} sku={sku or '∅'}")
-            # 避免重复清零：如果表格数量列已经是 0，则跳过
-            qty_now = _read_qty_from_row(row)
-            if qty_now == 0:
-                print(f"[YAHOO] {ident} already 0 (deleted link), skip notify/clear.")
-                continue
-
-            res = update_qty_with_fallback(item_id=item_id, sku=sku, quantity=0)
-            if res.get("ok"):
-                notify(f"🗑️ [YAHOO] 链接失效 → eBay 已清零\nSKU: {sku or '(no-sku)'}\n{url}")
-            else:
-                notify(f"❌ [YAHOO] 链接失效但 eBay 清零失败：{ident}\n{url}")
-            continue
-
-        # 判状态
-        status = "UNKNOWN" if code != 200 else yahoo.detect(html)
-        print(f"[YAHOO] {url} HTTP={code} status={status} trigger={trigger} sku={sku or '∅'}")
-
-        # 状态不明 -> 跳过
-        if status == "UNKNOWN":
-            print(f"[YAHOO] SKIP: {ident} status UNKNOWN, no action.\n")
-            continue
-
-        # 不符合触发条件 -> 跳过
-        if not _should_zero(trigger, status):
-            continue
-
-        # 避免重复清零：若表格里数量已经是 0，就不再发通知/清零
-        qty_now = _read_qty_from_row(row)
-        if qty_now == 0:
-            print(f"[YAHOO] {ident} already 0, skip notify/clear.")
-            continue
-
-        # 走清零流程（并带 SKU、链接到通知中）
-        notify(f"⚠️ [YAHOO] 检测到售罄：{ident}\nSKU: {sku or '(no-sku)'}\n{url}")
-        res = update_qty_with_fallback(item_id=item_id, sku=sku, quantity=0)
-        if res.get("ok"):
-            notify(f"✅ [YAHOO] eBay 已清零\nSKU: {sku or '(no-sku)'}\n{url}")
-        else:
-            notify(f"❌ [YAHOO] eBay 清零失败：{ident}\n{url}")
-
-    if matched == 0:
-        print("No Yahoo rows matched. Check headers/domains.")
-
-
-if __name__ == "__main__":
-    run_once()
+    # 默认：当做还在售
+    return "IN_STOCK"
 
