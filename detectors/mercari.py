@@ -28,17 +28,6 @@ def detect(html: str) -> str:
     ]
     if any(m in text for m in deleted_markers):
         return "DELETED"
-
-    # ---------- (2) 可购买信号（优先判定有货） ----------
-    # 若出现购买按钮、加入购物车等文字 → 明确 IN_STOCK
-    buy_signals = [
-        "購入手続きへ",      # 常规购买按钮
-        "購入に進む",        # 一些AB测试按钮文案
-        "カートに入れる",    # 加入购物车（App端）
-    ]
-    if any(s in text for s in buy_signals):
-        return "IN_STOCK"
-
     # ---------- (3) 售罄 ----------
     soldout_markers = [
         "売り切れました",
@@ -62,7 +51,15 @@ def detect(html: str) -> str:
             return "OUT_OF_STOCK"
         if "in_stock" in val:
             return "IN_STOCK"
-
+# ---------- (2) 可购买信号（优先判定有货） ----------
+    # 若出现购买按钮、加入购物车等文字 → 明确 IN_STOCK
+    buy_signals = [
+        "購入手続きへ",      # 常规购买按钮
+        "購入に進む",        # 一些AB测试按钮文案
+        "カートに入れる",    # 加入购物车（App端）
+    ]
+    if any(s in text for s in buy_signals):
+        return "IN_STOCK"
     # ---------- (5) 其它情况 ----------
     return "UNKNOWN"
 
