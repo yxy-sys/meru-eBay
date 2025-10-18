@@ -63,4 +63,3 @@ def detect(html: str) -> str:
         return "IN_STOCK"
     # ---------- (5) 其它情况 ----------
     return "UNKNOWN"
-
