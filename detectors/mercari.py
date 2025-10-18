@@ -17,17 +17,17 @@ def detect(html: str) -> str:
 
     # 1) 删除/下架
     deleted_markers = [
-        "該当する商品は削除されています。",
-        "この商品は削除されました",
-        "この商品は出品停止中です",
-        "この商品は公開停止中です",
-        "ページが見つかりません",
-        "商品が見つかりません",
+       "該当する商品は削除されています。",
+       "この商品は削除されました",
+       "この商品は出品停止中です",
+       "この商品は公開停止中です",
+       "ページが見つかりません",
+       "商品が見つかりません",
     ]
     if any(m in text for m in deleted_markers):
         return "DELETED"
 
-    # 2) 可购买（优先判断）：按钮文案 / 购买链接特征
+     2) 可购买（优先判断）：按钮文案 / 购买链接特征
     buy_signals = [
         "購入手続きへ",  # 常规购买按钮
         "購入に進む",
@@ -61,8 +61,8 @@ def detect(html: str) -> str:
         if "out_of_stock" in val or "sold" in val:
             return "OUT_OF_STOCK"
 
-    if any(m in text for m in sold_markers):
-        return "OUT_OF_STOCK"
+   # if any(m in text for m in sold_markers):
+   #     return "OUT_OF_STOCK"
 
     # 4) 其余 -> UNKNOWN
     return "UNKNOWN"
