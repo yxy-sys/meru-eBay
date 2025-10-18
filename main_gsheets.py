@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from sheet_reader import read_ledger
 from fetcher import fetch
 from detectors import mercari
-from ebay_updater import revise_inventory_status
+from ebay_updater import update_qty_with_fallback   # ✅ 改：用带回退的方法
 from notify import notify
 
 load_dotenv()
@@ -33,11 +33,10 @@ def should_zero(trigger: str, status: str) -> bool:
     - trigger = lowstock -> 当 status ∈ {OUT_OF_STOCK, LOW_STOCK}
     - 其它/未知           -> 不清 0
     """
-    # ✅ 新增：删除/结束统一当作需要清 0
+    # ✅ 删除/结束统一当作需要清 0
     if status in ("DELETED", "REMOVED", "ENDED"):
         return True
 
-    # 原有逻辑
     if status == "UNKNOWN":
         return False
 
@@ -47,6 +46,25 @@ def should_zero(trigger: str, status: str) -> bool:
     if t == "lowstock":
         return status in ("OUT_OF_STOCK", "LOW_STOCK")
     return False
+
+
+def _format_used(res: dict) -> str:
+    """
+    组合本次清零所用的路径说明（SKU / ItemID / 回退情况）。
+    """
+    if not isinstance(res, dict):
+        return ""
+    fb = res.get("fallback")
+    first = res.get("first") or {}
+    second = res.get("second") or {}
+    # used 字段在 revise_inventory_status 返回里
+    u1 = first.get("used")
+    u2 = second.get("used")
+    if fb == "item_id":
+        # 先 SKU 失败，后用 ItemID 成功/失败
+        return "SKU → ItemID"
+    # 无回退，直接使用 first.used
+    return u1 or u2 or ""
 
 
 def run_once():
@@ -74,21 +92,37 @@ def run_once():
 
         ident = sku if sku else (item_id if item_id else "(no-id)")
 
+        # 若既无 SKU 又无 ItemID，无法清零，直接跳过但打印一行日志
+        if (not sku) and (not item_id):
+            print(f"[MERCARI] {url} both SKU & ItemID missing, skip.\n")
+            continue
+
         # 抓页面
         code, html = fetch(url)
 
-        # === 链接被删除(404/410) → 直接清 0 并通知（沿用你原逻辑） ===
+        # === 链接被删除(404/410) → 直接清 0 并通知 ===
         if code in (404, 410):
             print(f"[MERCARI] {url} HTTP={code} status=DELETED trigger={trigger} sku={sku or '∅'}")
-            res = revise_inventory_status(item_id=item_id, sku=sku, quantity=0)
+            res = update_qty_with_fallback(item_id=item_id, sku=sku, quantity=0)
             print("eBay update (deleted link):", res)
+
+            used_path = _format_used(res)
             if res.get("ok"):
-                notify(f"🗑️ [MERCARI] 链接失效（HTTP {code}）→ eBay 已清零：{ident}\n{url}")
+                notify(
+                    f"🗑️ [MERCARI] 链接失效（HTTP {code}）→ eBay 已清零\n"
+                    f"SKU={sku or '∅'}  ItemID={item_id or '∅'}  方式={used_path}\n{url}"
+                )
             else:
-                status_code = res.get("status")
-                body = res.get("body") or res.get("error") or ""
+                last = res.get("second") or res.get("first") or {}
+                status_code = last.get("status")
+                body = last.get("body") or last.get("error") or res.get("error") or ""
                 snippet = str(body)[:500]
-                notify(f"❌ 链接失效但 eBay 清零失败：{ident}\nHTTP={status_code}\n{snippet}\n{url}")
+                used = last.get("used") or used_path
+                notify(
+                    f"❌ [MERCARI] 链接失效但 eBay 清零失败\n"
+                    f"SKU={sku or '∅'}  ItemID={item_id or '∅'}  方式={used}\n"
+                    f"HTTP={status_code}\n{snippet}\n{url}"
+                )
             continue
         # === 结束 ===
 
@@ -97,26 +131,39 @@ def run_once():
 
         print(f"[MERCARI] {url} HTTP={code} status={status} trigger={trigger} sku={sku or '∅'}")
 
-        # 按规则决定是否清 0（此处的 should_zero 已把 DELETED/ENDED 视为需要清 0）
+        # 按规则决定是否清 0（should_zero 已包含 DELETED/ENDED）
         if not should_zero(trigger, status):
-            # 同步成功但没清 0：不通知
+            # 不符合清零条件：不通知
             continue
 
-        # ① 售罄/删除提示
-        notify(f"⚠️ 检测到煤炉售罄或链接失效：{ident}\n{url}")
+        # ① 售罄/删除提示（前置提示）
+        notify(
+            f"⚠️ [MERCARI] 检测到售罄或链接失效，准备清零\n"
+            f"SKU={sku or '∅'}  ItemID={item_id or '∅'}\n{url}"
+        )
 
-        # ② 调用 eBay 清 0
-        res = revise_inventory_status(item_id=item_id, sku=sku, quantity=0)
+        # ② eBay 清 0（SKU 优先，必要时回退 ItemID）
+        res = update_qty_with_fallback(item_id=item_id, sku=sku, quantity=0)
         print("eBay update:", res)
 
-        # ③ 根据 eBay 结果发通知
+        # ③ 根据结果发通知（带 SKU 与链接）
+        used_path = _format_used(res)
         if res.get("ok"):
-            notify(f"✅ eBay 库存已清零：{ident}")
+            notify(
+                f"✅ eBay 库存已清零\n"
+                f"SKU={sku or '∅'}  ItemID={item_id or '∅'}  方式={used_path}\n{url}"
+            )
         else:
-            status_code = res.get("status")
-            body = res.get("body") or res.get("error") or ""
+            last = res.get("second") or res.get("first") or {}
+            status_code = last.get("status")
+            body = last.get("body") or last.get("error") or res.get("error") or ""
             snippet = str(body)[:500]
-            notify(f"❌ eBay 清零失败：{ident}\nHTTP={status_code}\n{snippet}")
+            used = last.get("used") or used_path
+            notify(
+                f"❌ eBay 清零失败\n"
+                f"SKU={sku or '∅'}  ItemID={item_id or '∅'}  方式={used}\n"
+                f"HTTP={status_code}\n{snippet}\n{url}"
+            )
 
     if matched == 0:
         print("No Mercari rows matched. Check headers/domains.")
