@@ -58,11 +58,11 @@ def detect(html: str) -> str:
         val = (meta.get("content") or meta.get("href") or "").lower()
         if "in_stock" in val:
             return "IN_STOCK"
-        if "out_of_stock" in val or "sold" in val:
-            return "OUT_OF_STOCK"
+   #     if "out_of_stock" in val or "sold" in val:
+   #         return "OUT_OF_STOCK"
 
-   # if any(m in text for m in sold_markers):
-   #     return "OUT_OF_STOCK"
+    if any(m in text for m in sold_markers):
+        return "OUT_OF_STOCK"
 
     # 4) 其余 -> UNKNOWN
     return "UNKNOWN"
