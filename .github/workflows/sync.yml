@@ -2,7 +2,7 @@ name: meru-ebay-sync
 
 on:
   schedule:
-    # 每 15 分钟运行一次（UTC）
+    # 每 45 分钟运行一次（UTC）
     - cron: "*/45 * * * *"
   workflow_dispatch:
 
