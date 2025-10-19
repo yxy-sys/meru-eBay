@@ -52,14 +52,44 @@ def detect(html: str) -> str:
        # if "out_of_stock" in val or "sold" in val:
        #    return "OUT_OF_STOCK"
 
-    # 4) 明确的日文售罄提示（避免英文 SOLD/SOLD OUT 造成图片水印误伤）
-    sold_markers = [
-        "売り切れました",
-        "売り切れました。",
-        "売り切れ",
-        "売り切れのため購入できません",
-    ]
+    # 4) 售罄提示
+   # ---------- (3) 灰色按钮「売り切れました」 ----------
+    for btn in soup.find_all("button"):
+        label = btn.get_text(strip=True)
+        if "売り切れました" in label:
+            print("[MERCARI DETECT] matched: disabled button text 売り切れました")
+            return "OUT_OF_STOCK"
+        if (btn.has_attr("disabled") or btn.get("aria-disabled") == "true") and re.search("売|切|れ", label):
+            print("[MERCARI DETECT] matched: disabled button (aria-disabled)")
+            return "OUT_OF_STOCK"
+
+    # ---------- (4) meta availability ----------
+    meta = (
+        soup.find("meta", {"property": "product:availability"})
+        or soup.find("meta", {"itemprop": "availability"})
+        or soup.find("link", {"itemprop": "availability"})
+    )
+    if meta:
+        val = (meta.get("content") or meta.get("href") or "").lower()
+        if "out_of_stock" in val or "sold" in val:
+            print("[MERCARI DETECT] matched: meta out_of_stock/sold")
+            return "OUT_OF_STOCK"
+        if "in_stock" in val:
+            print("[MERCARI DETECT] matched: meta in_stock")
+            return "IN_STOCK"
+
+    # ---------- (5) HTML class 中的 sold ----------
+    if re.search(r'class=["\'].*sold.*["\']', html_lower):
+        print("[MERCARI DETECT] matched: class contains sold")
+        return "OUT_OF_STOCK"
+    if "itemstatuslabel__sold" in html_lower or "itemsoldbadge" in html_lower:
+        print("[MERCARI DETECT] matched: sold class keywords")
+        return "OUT_OF_STOCK"
+
+    # ---------- (6) 文本包含「売り切れ」 ----------
+    sold_markers = ["売り切れました", "売り切れました。", "売り切れ", "売り切れのため購入できません"]
     if any(m in text for m in sold_markers):
+        print("[MERCARI DETECT] matched: sold text marker")
         return "OUT_OF_STOCK"
 
     # 5) 其余情况
