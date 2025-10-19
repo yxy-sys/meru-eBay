@@ -1,20 +1,23 @@
 from bs4 import BeautifulSoup
 import re
+
 def detect(html: str) -> str:
     """
-    Mercari 状态检测（防误报版）：
+    Mercari 状态检测（含灰色售罄按钮 + 调试来源输出）：
       - 删除/下架  -> DELETED
-      - 可购买     -> IN_STOCK  （优先判断）
-      - 售罄       -> OUT_OF_STOCK
+      - 可购买     -> IN_STOCK
+      - 售罄       -> OUT_OF_STOCK（含灰按钮「売り切れました」）
       - 不确定     -> UNKNOWN
     """
     if not html:
+        print("[MERCARI DETECT] empty html")
         return "UNKNOWN"
 
     soup = BeautifulSoup(html, "lxml")
     text = soup.get_text(" ", strip=True)
+    html_lower = html.lower()
 
-    # 1) 删除 / 下架
+    # ---------- (1) 删除 / 下架 ----------
     deleted_markers = [
         "該当する商品は削除されています。",
         "この商品は削除されました",
@@ -24,36 +27,19 @@ def detect(html: str) -> str:
         "商品が見つかりません",
     ]
     if any(m in text for m in deleted_markers):
+        print("[MERCARI DETECT] matched: deleted marker text")
         return "DELETED"
 
-    # 2) 可购买（优先判断）：按钮文案 / 购买链接特征
-    buy_signals = [
-        "購入手続きへ",   # 常规购买按钮
-        "購入に進む",
-        "購入へ",
-        "カートに入れる",
-    ]
+    # ---------- (2) 可购买 ----------
+    buy_signals = ["購入手続きへ", "購入に進む", "購入へ", "カートに入れる"]
     if any(s in text for s in buy_signals):
+        print("[MERCARI DETECT] matched: buy button text")
         return "IN_STOCK"
-    # PC 端常见的购买链接
-    if "/transaction/buy" in html:
+    if "/transaction/buy" in html_lower:
+        print("[MERCARI DETECT] matched: buy link")
         return "IN_STOCK"
 
-    # 3) meta availability（在未命中“可购买”后参考）
-    meta = (
-        soup.find("meta", {"property": "product:availability"})
-        or soup.find("meta", {"itemprop": "availability"})
-        or soup.find("link", {"itemprop": "availability"})
-    )
-    if meta:
-        val = (meta.get("content") or meta.get("href") or "").lower()
-        if "in_stock" in val:
-            return "IN_STOCK"
-       # if "out_of_stock" in val or "sold" in val:
-       #    return "OUT_OF_STOCK"
-
-    # 4) 售罄提示
-   # ---------- (3) 灰色按钮「売り切れました」 ----------
+    # ---------- (3) 灰色按钮「売り切れました」 ----------
     for btn in soup.find_all("button"):
         label = btn.get_text(strip=True)
         if "売り切れました" in label:
@@ -92,7 +78,9 @@ def detect(html: str) -> str:
         print("[MERCARI DETECT] matched: sold text marker")
         return "OUT_OF_STOCK"
 
-    # 5) 其余情况
+    # ---------- (7) 未匹配 ----------
+    print("[MERCARI DETECT] no match → UNKNOWN")
     return "UNKNOWN"
+
 
 
