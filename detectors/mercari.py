@@ -1,5 +1,5 @@
 from bs4 import BeautifulSoup
-
+import re
 def detect(html: str) -> str:
     """
     Mercari 状态检测（防误报版）：
