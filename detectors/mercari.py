@@ -2,18 +2,27 @@
 from bs4 import BeautifulSoup
 import json, re
 
-_ZW = "\u200b\u200c\u200d\uFEFF"
-def norm_text(s: str) -> str:
+# 允许在字符之间穿插任意标签/空白的 HTML 级别匹配
+def _html_has_phrase(html: str, phrase: str) -> bool:
+    # 构造形如:  購(?:<[^>]*>|\s|&nbsp;)*入(?:<...>)*手(?:<...>)*続(?:<...>)*き(?:<...>)*へ
+    parts = []
+    for ch in phrase:
+        parts.append(re.escape(ch))
+        parts.append(r'(?:<[^>]*>|\s|&nbsp;|&#160;)*')  # 允许标签、空白、nbsp
+    pat = ''.join(parts[:-1])  # 去掉最后一个“允许夹杂”的片段
+    try:
+        return re.search(pat, html, flags=re.I | re.S) is not None
+    except re.error:
+        return False
+
+def _norm(s: str) -> str:
     if not s:
         return ""
-    s = s.replace("\u3000", " ")
-    for ch in _ZW:
+    s = s.replace("\u3000", " ")            # 全角空格->半角
+    for ch in ("\u200b", "\u200c", "\u200d", "\ufeff"):
         s = s.replace(ch, "")
     s = re.sub(r"\s+", " ", s, flags=re.S)
     return s.strip()
-
-BUY_REGEX  = re.compile(r"購\s*入.*(手\s*続\s*き\s*へ|へ|に\s*進\s*む)", re.S)
-SOLD_REGEX = re.compile(r"(売\s*り\s*切\s*れ(\s*ま\s*し\s*た)?|取引が終了|SOLD\s*OUT)", re.I)
 
 def _jsonld_availability(soup: BeautifulSoup):
     for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
@@ -21,15 +30,15 @@ def _jsonld_availability(soup: BeautifulSoup):
             data = json.loads(tag.string or "{}")
         except Exception:
             continue
-        arr = data if isinstance(data, list) else [data]
-        for obj in arr:
+        objs = data if isinstance(data, list) else [data]
+        for obj in objs:
+            if not isinstance(obj, dict): 
+                continue
             avail = None
-            if isinstance(obj, dict):
-                offers = obj.get("offers")
-                if isinstance(offers, dict):
-                    avail = offers.get("availability")
-                if not avail:
-                    avail = obj.get("availability")
+            offers = obj.get("offers")
+            if isinstance(offers, dict):
+                avail = offers.get("availability")
+            avail = avail or obj.get("availability")
             if not avail:
                 continue
             v = str(avail).lower()
@@ -39,23 +48,16 @@ def _jsonld_availability(soup: BeautifulSoup):
                 return "out"
     return None
 
-def _extract_text_dump(html: str) -> str:
-    m = re.search(r"<!--TEXT_DUMP_START-->(.*?)<!--TEXT_DUMP_END-->", html, re.S)
-    if not m:
-        return ""
-    return norm_text(m.group(1))
-
 def detect(html: str) -> str:
     if not html:
         print("[MERCARI DETECT] empty html")
         return "UNKNOWN"
 
     soup = BeautifulSoup(html, "lxml")
-    page_text = norm_text(soup.get_text(" ", strip=True))
-    text_dump = _extract_text_dump(html)
+    text = _norm(soup.get_text(" ", strip=True))
 
     # 1) 删除/下架
-    deleted_markers = [
+    deleted = [
         "該当する商品は削除されています。",
         "この商品は削除されました",
         "この商品は出品停止中です",
@@ -63,89 +65,63 @@ def detect(html: str) -> str:
         "ページが見つかりません",
         "商品が見つかりません",
     ]
-    if any(m in page_text for m in deleted_markers):
-        print("[MERCARI DETECT] matched: deleted marker")
+    if any(m in text for m in deleted):
+        print("[MERCARI DETECT] deleted marker")
         return "DELETED"
 
-    # 2) JSON-LD / meta
+    # 2) 结构化信号（最快的）
     jl = _jsonld_availability(soup)
     if jl == "in":
-        print("[MERCARI DETECT] matched: jsonld=IN_STOCK")
+        print("[MERCARI DETECT] jsonld=IN_STOCK")
         return "IN_STOCK"
     if jl == "out":
-        print("[MERCARI DETECT] matched: jsonld=OUT_OF_STOCK")
+        print("[MERCARI DETECT] jsonld=OUT_OF_STOCK")
         return "OUT_OF_STOCK"
 
+    # 3) meta/link 可用性
     meta = (soup.find("meta", {"itemprop": "availability"})
             or soup.find("meta", {"property": "product:availability"})
             or soup.find("link", {"itemprop": "availability"}))
     if meta:
-        val = norm_text(meta.get("content") or meta.get("href") or "").lower()
+        val = _norm(meta.get("content") or meta.get("href") or "").lower()
         if any(k in val for k in ("instock", "in_stock")):
-            print("[MERCARI DETECT] matched: meta=IN_STOCK")
+            print("[MERCARI DETECT] meta=IN_STOCK")
             return "IN_STOCK"
         if any(k in val for k in ("outofstock", "out_of_stock", "sold")):
-            print("[MERCARI DETECT] matched: meta=OUT_OF_STOCK")
+            print("[MERCARI DETECT] meta=OUT_OF_STOCK")
             return "OUT_OF_STOCK"
 
-    # 3) 遍历按钮/链接
-    buy_found  = False
-    sold_found = False
-    samples = []
+    # 4) HTML 级别“宽松短语匹配”，允许字符间穿插标签/空白
+    buy_hit  = (
+        _html_has_phrase(html, "購入手続きへ")
+        or _html_has_phrase(html, "購入に進む")
+        or _html_has_phrase(html, "購入へ")
+        or "/transaction/buy" in html or "/transaction/buys" in html
+    )
+    sold_hit = (
+        _html_has_phrase(html, "売り切れました")
+        or _html_has_phrase(html, "売り切れ")
+        or _html_has_phrase(html, "取引が終了")
+        or re.search(r"S\s*O\s*L\s*D\s*O\s*U\s*T", html, flags=re.I | re.S) is not None
+    )
 
-    for b in soup.find_all("button"):
-        t = norm_text(b.get_text(" ", strip=True))
-        a = norm_text(b.get("aria-label") or "")
-        if t:
-            samples.append(t)
-        disabled = (b.has_attr("disabled") or b.get("aria-disabled") in ("true", "1"))
-        if BUY_REGEX.search(t) or BUY_REGEX.search(a):
-            buy_found = True
-        if SOLD_REGEX.search(t) or SOLD_REGEX.search(a):
-            if disabled or "売り切れ" in t or "売り切れ" in a:
-                sold_found = True
+    # 打印命中情况用于调试
+    print(f"[MERCARI DETECT] html-match buy={buy_hit} sold={sold_hit}")
 
-    for a in soup.find_all("a"):
-        t = norm_text(a.get_text(" ", strip=True))
-        ar = norm_text(a.get("aria-label") or "")
-        if t and len(samples) < 6:
-            samples.append(t)
-        if BUY_REGEX.search(t) or BUY_REGEX.search(ar):
-            buy_found = True
-        if SOLD_REGEX.search(t) or SOLD_REGEX.search(ar):
-            sold_found = True
-
-    if samples:
-        print("[MERCARI DETECT] buttons sample:", " | ".join(samples[:6]))
-
-    # 购买动作链接兜底
-    if "/transaction/buy" in html or "/transaction/buys" in html:
-        buy_found = True
-
-    if buy_found and not sold_found:
-        print("[MERCARI DETECT] matched: BUY signals")
+    # 5) 规则
+    if buy_hit and not sold_hit:
+        print("[MERCARI DETECT] => IN_STOCK (buy only)")
         return "IN_STOCK"
-    if sold_found and not buy_found:
-        print("[MERCARI DETECT] matched: SOLD signals")
+    if sold_hit and not buy_hit:
+        print("[MERCARI DETECT] => OUT_OF_STOCK (sold only)")
         return "OUT_OF_STOCK"
-
-    # 4) 纯文本兜底（来自 fetcher 注入的 TEXT_DUMP）
-    if text_dump:
-        if BUY_REGEX.search(text_dump):
-            print("[MERCARI DETECT] matched: TEXT_DUMP BUY")
-            return "IN_STOCK"
-        if SOLD_REGEX.search(text_dump):
-            print("[MERCARI DETECT] matched: TEXT_DUMP SOLD")
-            return "OUT_OF_STOCK"
-
-    # 5) 再兜底：整页文本见到“売り切れ”且没有 buy
-    if not buy_found and SOLD_REGEX.search(page_text):
-        print("[MERCARI DETECT] matched: SOLD badge (fallback)")
+    if sold_hit and buy_hit:
+        # 若两者都出现，优先 SOLD（更保守）
+        print("[MERCARI DETECT] => OUT_OF_STOCK (both signals)")
         return "OUT_OF_STOCK"
 
     print("[MERCARI DETECT] no rule matched -> UNKNOWN")
     return "UNKNOWN"
-
 
 
 
