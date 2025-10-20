@@ -1,148 +1,117 @@
 # detectors/mercari.py
-from bs4 import BeautifulSoup
-from typing import Iterable, Optional
+# -*- coding: utf-8 -*-
+"""
+Mercari 商品状态检测（稳定版）
+判定原则：
+  - 仅当页面上出现并可点击的「購入手続きへ」按钮时，判定为 IN_STOCK
+  - 否则依次检测售罄按钮/文案/SOLD 缎带/LD-JSON 结构化数据/404 文案
+  - 都未命中时，出于保守策略按 SOLD_OUT（fallback）返回
+对外接口：
+  detect(page: Page, wait_ms: int = 8000) -> tuple[str, str]
+"""
 
-# ---- 可根据需要扩展的配置 ----
-HIDE_CLASSES = {"sr-only"}  # 常见隐藏类
-HIDE_STYLE_KEYWORDS = ("display:none", "visibility:hidden")  # 简单样式隐藏判定
-BUY_LABELS = ("購入手続きへ", "購入に進む", "購入へ")        # 购买按钮常见文案
-SOLD_LABELS = ("売り切れました", "売り切れのため購入できません")  # 售罄按钮常见文案
+from __future__ import annotations
+import re
+from typing import Tuple
+from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
 
-DELETED_MARKERS = (
-    "該当する商品は削除されています。",
-    "この商品は削除されました",
-    "この商品は出品停止中です",
-    "この商品は公開停止中です",
-    "ページが見つかりません",
-    "商品が見つかりません",
-)
+# ---- 文案特征（尽量只用可见文本/ARIA，避免样式类名） ----
+BUY_BTN_RE     = re.compile(r"(購入手続きへ|Buy now|Proceed to purchase)", re.I)
+SOLD_BTN_RE    = re.compile(r"(売り切れました|SOLD OUT|販売停止中|取引中|公開停止中)", re.I)
+SOLD_TXT_RE    = re.compile(r"(売り切れました|この商品は.*で配送されました|取引が終了しました|この商品は削除されました)", re.S)
+SOLD_BADGE_RE  = re.compile(r"\bSOLD\b", re.I)
 
+STATUS_IN_STOCK = "IN_STOCK"
+STATUS_SOLD_OUT = "SOLD_OUT"
+STATUS_UNAVAIL  = "UNAVAILABLE"
+STATUS_UNKNOWN  = "UNKNOWN"
 
-def _text(el) -> str:
-    """安全取文本（已 strip）。"""
-    return (el.get_text(strip=True) or "") if el else ""
-
-
-def _has_any(text: str, needles: Iterable[str]) -> bool:
-    return any(n in text for n in needles)
-
-
-def _is_node_or_ancestor_hidden(el) -> bool:
+def detect(page: Page, wait_ms: int = 8000) -> Tuple[str, str]:
     """
-    判断元素或其祖先是否被“隐藏”：
-    - hidden / aria-hidden="true"
-    - style 显式隐藏（display:none / visibility:hidden）
-    - 隐藏类（如 sr-only）
+    入口：返回 (status, trigger)
+    status ∈ {"IN_STOCK","SOLD_OUT","UNAVAILABLE","UNKNOWN"}
+    trigger 用于日志定位命中规则
     """
-    cur = el
-    while cur is not None:
-        # attribute
-        if cur.has_attr("hidden") or cur.get("aria-hidden") == "true":
-            return True
+    # --- 等首屏和尽量网络静默（Mercari 为 Next.js，需等水合） ---
+    try:
+        page.wait_for_load_state("domcontentloaded")
+        try:
+            page.wait_for_load_state("networkidle", timeout=5000)
+        except PlaywrightTimeoutError:
+            # 某些资源长连，允许忽略
+            pass
+    except Exception:
+        # 页面都没起好，给个保守结果
+        return STATUS_SOLD_OUT, "bootstrap-failed"
 
-        # style
-        style = (cur.get("style") or "").replace(" ", "").lower()
-        if any(k in style for k in HIDE_STYLE_KEYWORDS):
-            return True
+    # 1) 唯一正向：可见且可点击的“購入手続きへ”
+    try:
+        buy_btn = page.get_by_role("button", name=BUY_BTN_RE).first
+        buy_btn.wait_for(state="visible", timeout=wait_ms)
+        if buy_btn.is_enabled():
+            return STATUS_IN_STOCK, "button:購入手続きへ"
+    except PlaywrightTimeoutError:
+        pass
+    except Exception:
+        pass
 
-        # class
-        cls = cur.get("class") or []
-        if any(c in HIDE_CLASSES for c in cls):
-            return True
+    # 2) 售罄按钮（灰色/不可点击）
+    try:
+        sold_btn = page.get_by_role("button", name=SOLD_BTN_RE).first
+        sold_btn.wait_for(state="visible", timeout=2000)
+        try:
+            label = sold_btn.inner_text().strip()
+        except Exception:
+            label = "売り切れ"
+        return STATUS_SOLD_OUT, f"button:{label[:32]}"
+    except PlaywrightTimeoutError:
+        pass
+    except Exception:
+        pass
 
-        cur = cur.parent
-    return False
+    # 3) 售罄/已配送完成等文案兜底
+    body_text = ""
+    try:
+        body_text = page.locator("body").inner_text(timeout=2000)
+    except Exception:
+        body_text = ""
+    if SOLD_TXT_RE.search(body_text or ""):
+        return STATUS_SOLD_OUT, "text:売り切れ/配送/終了"
+
+    # 4) SOLD 缎带（常出现在无障碍 aria-label）
+    try:
+        aria_concat = " ".join(page.locator("//*").evaluate_all(
+            "els => els.map(e => e.getAttribute('aria-label')||'').join(' ')"
+        ) or [])
+        if SOLD_BADGE_RE.search(aria_concat):
+            return STATUS_SOLD_OUT, "aria-label:SOLD"
+    except Exception:
+        pass
+
+    # 5) 结构化数据 availability
+    try:
+        ld_json_list = page.locator('script[type="application/ld+json"]').all_inner_texts()
+        if any('"availability"' in s for s in ld_json_list):
+            joined = " ".join(ld_json_list)
+            if "InStock" in joined:
+                return STATUS_IN_STOCK, "ldjson:InStock"
+            if any(k in joined for k in ("SoldOut", "OutOfStock", "Discontinued")):
+                return STATUS_SOLD_OUT, "ldjson:SoldOut"
+    except Exception:
+        pass
+
+    # 6) 404/已删除
+    if "ページが見つかりません" in (body_text or ""):
+        return STATUS_UNAVAIL, "text:ページが見つかりません"
+
+    # 7) 最保守兜底：看不到购买按钮就视为不可购买
+    return STATUS_SOLD_OUT, "fallback:no-buy-button"
 
 
-def _find_visible_label(soup: BeautifulSoup, labels: Iterable[str]) -> Optional[str]:
-    """
-    在 button/a 等候选可点击元素上寻找“可见”的目标文案。
-    返回命中的文案；找不到返回 None。
-    """
-    candidates = soup.find_all(["button", "a"])
-    for el in candidates:
-        label = _text(el)
-        if not label:
-            continue
-
-        if _has_any(label, labels):
-            # 过滤不可见/禁用
-            if _is_node_or_ancestor_hidden(el):
-                continue
-            if el.get("disabled") is not None or el.get("aria-disabled") == "true":
-                # 被禁用通常可见但不可点（售罄按钮常如此）；这里不提前排除，交给上层判断：
-                # - 售罄按钮：禁用但可见 => 当作 OUT_OF_STOCK
-                # - 购买按钮：若禁用（非常少见），当作不可购买
-                pass
-            return label
-    return None
-
-
-def _meta_availability(soup: BeautifulSoup) -> Optional[str]:
-    """
-    读取 meta availability 的兜底：in_stock/out_of_stock。
-    返回 'IN_STOCK' / 'OUT_OF_STOCK' / None
-    """
-    meta = (
-        soup.find("meta", {"property": "product:availability"})
-        or soup.find("meta", {"itemprop": "availability"})
-        or soup.find("link", {"itemprop": "availability"})
-    )
-    if not meta:
-        return None
-
-    val = (meta.get("content") or meta.get("href") or "").strip().lower()
-    if "out_of_stock" in val or "sold" in val:
-        return "OUT_OF_STOCK"
-    if "in_stock" in val:
-        return "IN_STOCK"
-    return None
-
-
-def detect(html: str) -> str:
-    """
-    Mercari 状态检测（可见性优先、防误报版）：
-      - 删除/下架: DELETED
-      - 灰按钮“売り切れました”可见: OUT_OF_STOCK
-      - 红按钮“購入手続きへ”可见: IN_STOCK
-      - meta availability 兜底
-      - 文本兜底（最后才做）
-      - 仍不确定: UNKNOWN
-    """
-    if not html:
-        return "UNKNOWN"
-
-    soup = BeautifulSoup(html, "lxml")
-
-    # 1) 删除/下架
-    page_text = soup.get_text(" ", strip=True)
-    if _has_any(page_text, DELETED_MARKERS):
-        return "DELETED"
-
-    # 2) 售罄（只看“可见”的按钮）
-    sold = _find_visible_label(soup, SOLD_LABELS)
-    if sold:
-        # 售罄按钮（通常可见且禁用）优先级最高
-        return "OUT_OF_STOCK"
-
-    # 3) 可购买（只看“可见”的按钮）
-    buy = _find_visible_label(soup, BUY_LABELS)
-    if buy:
-        return "IN_STOCK"
-
-    # 4) meta availability 兜底
-    meta_status = _meta_availability(soup)
-    if meta_status:
-        return meta_status
-
-    # 5) 纯文本兜底（放最后，避免把隐藏节点文本误当真）
-    #    例如：只有图片角标 SOLD、或模板里同时渲染买/售罄但隐藏其中之一
-    if _has_any(page_text, SOLD_LABELS):
-        return "OUT_OF_STOCK"
-    if _has_any(page_text, BUY_LABELS):
-        return "IN_STOCK"
-
-    return "UNKNOWN"
+# 便于外部统一导入
+NAME = "mercari"
+__all__ = ["detect", "NAME",
+           "STATUS_IN_STOCK", "STATUS_SOLD_OUT", "STATUS_UNAVAIL", "STATUS_UNKNOWN"]
 
 
 
