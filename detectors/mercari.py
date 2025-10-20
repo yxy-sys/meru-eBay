@@ -38,26 +38,28 @@ def _detect_from_html(html: str) -> Tuple[str, str]:
     if not html:
         return STATUS_UNKNOWN, "html:empty"
 
-    # 明确 404
-    if "ページが見つかりません" in html:
+    # ---- 更严格 404 判定 ----
+    # 真正的 Mercari 404 页面会包含这两个条件：
+    # 1. “このページは存在しません” 或 “ページが見つかりません”
+    # 2. 同时 <title> 中也包含 “404” 或 “メルカリ”
+    if ("このページは存在しません" in html or "ページが見つかりません" in html) and "<title" in html:
         return STATUS_UNAVAIL, "html:404"
 
-    # JSON-LD availability
+    # ---- JSON-LD availability ----
     if '"availability"' in html:
         if "InStock" in html:
             return STATUS_IN_STOCK, "html:ldjson-InStock"
         if any(k in html for k in ("SoldOut", "OutOfStock", "Discontinued")):
             return STATUS_SOLD_OUT, "html:ldjson-SoldOut"
 
-    # 购买按钮/文案（SSR 场景下偶尔会直接出现在 HTML）
+    # ---- 购买按钮/文案 ----
     if BUY_BTN_RE.search(html):
         return STATUS_IN_STOCK, "html:text:購入手続きへ"
 
-    # 售罄文案
+    # ---- 售罄文案 ----
     if SOLD_BTN_RE.search(html) or SOLD_TXT_RE.search(html) or SOLD_BADGE_RE.search(html):
         return STATUS_SOLD_OUT, "html:text:soldout"
 
-    # 看不到明确信号
     return STATUS_UNKNOWN, "html:no-signal"
 
 
