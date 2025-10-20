@@ -127,9 +127,9 @@ def run_once():
         # === 结束 ===
 
         # 判状态
-        status = "UNKNOWN" if code != 200 else mercari.detect(html)
+        status, trigger = ("UNKNOWN", "no-http") if code != 200 else mercari.detect(page)
+        print(f"[MERCARI] {url} HTTP-{code} status={status} trigger={trigger} sku={sku}")
 
-        print(f"[MERCARI] {url} HTTP={code} status={status} trigger={trigger} sku={sku or '∅'}")
 
         # 按规则决定是否清 0（should_zero 已包含 DELETED/ENDED）
         if not should_zero(trigger, status):
