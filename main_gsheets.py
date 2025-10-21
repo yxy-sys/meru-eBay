@@ -1,4 +1,6 @@
 # main_gsheets.py
+# -*- coding: utf-8 -*-
+
 import os
 from dotenv import load_dotenv
 
@@ -8,13 +10,15 @@ from detectors import mercari
 from ebay_updater import update_qty_with_fallback
 from notify import notify
 
-# ✨ 新增：用 Page 做强判定，性能考虑整段复用一个浏览器/上下文
 from playwright.sync_api import sync_playwright
 
 load_dotenv()
 
 
+# -------------------- 辅助函数 --------------------
+
 def _is_blank(value) -> bool:
+    """将 None / 空串 / 'nan' / 'none' / 'null' 统一当作空"""
     if value is None:
         return True
     s = str(value).strip().lower()
@@ -22,6 +26,7 @@ def _is_blank(value) -> bool:
 
 
 def norm_trigger(v: str) -> str:
+    """把 trigger 标准化：空/无效 视作 'soldout'；其它统一转小写"""
     s = str(v or "").strip().lower()
     return "soldout" if s in ("", "nan", "none", "null") else s
 
@@ -47,6 +52,7 @@ def should_zero(rule_trigger: str, status: str) -> bool:
 
 
 def _format_used(res: dict) -> str:
+    """组合本次清零所用的路径说明（SKU / ItemID / 回退情况）。"""
     if not isinstance(res, dict):
         return ""
     fb = res.get("fallback")
@@ -59,14 +65,16 @@ def _format_used(res: dict) -> str:
     return u1 or u2 or ""
 
 
-def run_once():
-    df = read_ledger()
-    matched = 0
+# -------------------- 主流程 --------------------
 
+def run_once():
+    # 读取清单（你的 sheet_reader 已做了重试/超时）
+    df = read_ledger()
+
+    matched = 0
     UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 
-    # —— 打开一次浏览器，循环内复用 —— #
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         ctx = browser.new_context(
@@ -83,13 +91,14 @@ def run_once():
                 continue
             low_url = url.lower()
             if ("mercari.com" not in low_url) and ("jp.mercari.com" not in low_url):
+                # 只处理 Mercari
                 continue
 
             matched += 1
 
             item_id_raw = row.get("ebay_item_id", "")
             sku_raw = row.get("sku", "")
-            rule_trigger_raw = row.get("trigger", "")  # 表里的规则触发词
+            rule_trigger_raw = row.get("trigger", "")  # 表格里的“规则触发词”
 
             item_id = "" if _is_blank(item_id_raw) else str(item_id_raw).strip()
             sku = "" if _is_blank(sku_raw) else str(sku_raw).strip()
@@ -99,18 +108,42 @@ def run_once():
                 print(f"[MERCARI] {url} both SKU & ItemID missing, skip.\n")
                 continue
 
-            # 抓页面（requests）用于拿 HTTP 码 & HTML 兜底
-            code, html = fetch(url)
+            # —— 先 Playwright 导航（主路径）——
+            det_status, det_trigger = "UNKNOWN", "navigate-fail"
+            http_code = 0
+            try:
+                resp = page.goto(url, wait_until="domcontentloaded", timeout=35000)
+                http_code = resp.status if resp else 0
 
-            # === 404/410：直接按删除处理 ===
-            if code in (404, 410):
-                print(f"[MERCARI] {url} HTTP={code} status=DELETED trigger={rule_trigger} sku={sku or '∅'}")
+                # 强判定：可点击“購入手続きへ”才判在售
+                det_status, det_trigger = mercari.detect(page)
+
+                # 极少数水合异常：再用当前 DOM 的 HTML 做一次兜底
+                if det_status == "UNKNOWN":
+                    html_now = page.content()
+                    _s, _t = mercari.detect(html_now)
+                    if _s != "UNKNOWN":
+                        det_status, det_trigger = _s, f"fallback:{_t}"
+
+            except Exception as e:
+                # Playwright 导航失败：最后尝试 requests 兜底（也把 HTTP 码带上）
+                try:
+                    http_code, html2 = fetch(url)
+                    _s, _t = mercari.detect(html2)
+                    det_status = _s
+                    det_trigger = f"html:{_t}"
+                except Exception:
+                    det_status, det_trigger = "UNKNOWN", f"exception:{type(e).__name__}"
+
+            # 明确的 404/410（不常见，Playwright也能拿到）
+            if http_code in (404, 410):
+                print(f"[MERCARI] {url} HTTP-{http_code} status=DELETED trigger={rule_trigger} sku={sku or '∅'}")
                 res = update_qty_with_fallback(item_id=item_id, sku=sku, quantity=0)
                 print("eBay update (deleted link):", res)
                 used_path = _format_used(res)
                 if res.get("ok"):
                     notify(
-                        f"🗑️ [MERCARI] 链接失效（HTTP {code}）→ eBay 已清零\n"
+                        f"🗑️ [MERCARI] 链接失效（HTTP {http_code}）→ eBay 已清零\n"
                         f"SKU={sku or '∅'}  ItemID={item_id or '∅'}  方式={used_path}\n{url}"
                     )
                 else:
@@ -124,25 +157,12 @@ def run_once():
                         f"SKU={sku or '∅'}  ItemID={item_id or '∅'}  方式={used}\n"
                         f"HTTP={status_code}\n{snippet}\n{url}"
                     )
+                # 删除型处理完就进入下一条
                 continue
-            # === end ===
 
-            # —— 判状态（优先 Page；失败回退 HTML）——
-            det_status, det_trigger = "UNKNOWN", "no-http"
-            if code == 200:
-                try:
-                    resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    _ = resp.status if resp else 0  # 以防 None
-                    det_status, det_trigger = mercari.detect(page)
-                except Exception:
-                    # Playwright 导航失败：回退用 HTML 兜底
-                    det_status, det_trigger = mercari.detect(html)
-            else:
-                det_status, det_trigger = mercari.detect(html)
+            print(f"[MERCARI] {url} HTTP-{http_code} status={det_status} trigger={det_trigger} sku={sku}")
 
-            print(f"[MERCARI] {url} HTTP-{code} status={det_status} trigger={det_trigger} sku={sku}")
-
-            # —— 根据表内“规则触发词”决定是否清 0 —— #
+            # —— 根据“表格里的规则触发词”决定是否清 0 —— #
             if not should_zero(rule_trigger, det_status):
                 continue
 
@@ -185,4 +205,3 @@ def run_once():
 
 if __name__ == "__main__":
     run_once()
-
